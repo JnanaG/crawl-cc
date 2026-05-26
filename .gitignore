@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Project data (do not upload)
+data/
+
+# Runtime / logs
+*.log
+
+# Local env files
+.env
+.env.*
+
+# IDE files
+.vscode/
+.idea/
+
+.galaxycode-core/
+
+.galaxy/
+
+.crush/

@@ -1,0 +1,135 @@
+name: RAG 评估守门
+
+on:
+  pull_request:
+    paths:
+      - 'rag_*.py'
+      - 'langchain_rag/**'
+      - 'utils/embedding_client.py'
+      - 'utils/llm_client.py'
+      - 'utils/reranker_client.py'
+      - 'utils/faiss_vector_store.py'
+      - 'cleaner/**'
+      - 'utils/llm_processor.py'
+      - 'data/evaluation/golden_set.jsonl'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  rag-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+     uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ragas datasets
+
+      - name: 检查向量库是否存在
+        id: check_index
+        run: |
+          if [ -f "data/vector_store/faiss/dongchedi.index" ]; then
+            echo "index_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "index_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+      - name: 构建向量库（如果不存在）
+        if: steps.check_index.outputs.index_exists == 'false'
+        env:
+          # 使用 GitHub Secrets 配置 LLM/Embedding API
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+        run: |
+        # 如果没有训练数据，先生成一个小规模数据集用于测试
+          if [ ! -f "data/processed/dongchedi_training_data.jsonl" ]; then
+            echo "警告：训练数据不存在，跳过向量库构建"
+            echo "请在 PR 中包含预构建的向量库或训练数据"
+            exit 1
+          fi
+
+          # 构建向量库（使用 fastembed 避免依赖外部 API）
+          python rag_llm_demo.py build \
+            --embedding-provider fastembed \
+            --embedding-model BAAI/bge-small-zh-v1.5 \
+         --batch-size 128
+
+      - name: 运行 Ragas 评估
+        env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+        run: |
+          # 使用 fastembed（本地）+ OpenAI（评估用 LLM）
+          python rag_ragas_eval.py \
+            --golden-set data/evaluation/golden_set.jsonl \
+            --output data/evaluation/ragas_results.json \
+            --embedding-provider fastembed \
+            --embedding-model BAAI/bge-small-zh-v1.5 \
+            --llm-provider openai_compatible \
+      --llm-model gpt-4o-mini \
+          --retrieval-mode hybrid \
+            --top-k 6
+
+      - name: 检查评估阈值
+        run: |
+          python scripts/ci_eval_gate.py \
+            --results data/evaluation/ragas_results.json
+
+      - name: 上传评估报告
+        if: always()
+    uses: actions/upload-artifact@v4
+        with:
+        name: ragas-evaluation-report
+          path: data/evaluation/ragas_results.json
+          retention-days: 30
+
+      - name: 评论 PR（如果失败）
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## ❌ RAG 评估未通过\n\n';
+
+          try {
+              const results = JSON.parse(fs.readFileSync('data/evaluation/ragas_results.json', 'utf8'));
+              const metrics = results.metrics;
+
+              comment += '### 指标对比\n\n';
+       comment += '| 指标 | 实际值 | 阈值 | 状态 |\n';
+            comment += '|------|--------|------|------|\n';
+
+         const thresholds = {
+                faithfulness: 0.70,
+                answer_relevancy: 0.65,
+                context_precision: 0.60,
+             context_recall: 0.55
+           };
+
+              for (const [metric, threshold] of Object.entries(thresholds)) {
+         const actual = metrics[metric] || 0;
+           const status = actual >= threshold ? '✅' : '❌';
+                comment += `| ${metric} | ${actual.toFixed(4)} | ${threshold.toFixed(2)} | ${status} |\n`;
+              }
+
+              comment += '\n请优化 RAG 系统后重新提交。';
+            } catch (e) {
+          comment += '无法读取评估结果，请检查日志。';
+         }
+
+            github.rest.issues.createComment({
+           issue_number: context.issue.number,
+          owner: context.repo.owner,
+        repo: context.repo.repo,
+           body: comment
+            });
