@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Crawl_cc 智能数据 Pipeline 控制台</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h1>Crawl_cc</h1>
+      <p class="subtitle">智能数据 Pipeline 最小控制台</p>
+      <div class="section">
+        <button id="createSessionBtn" class="primary-btn">新建会话</button>
+        <div class="field">
+          <label for="userIdInput">用户 ID</label>
+          <input id="userIdInput" value="demo-user" />
+        </div>
+        <div class="field">
+          <label for="sessionIdInput">会话 ID</label>
+          <input id="sessionIdInput" placeholder="点击新建会话或从下方选择" />
+        </div>
+        <div class="field">
+          <label for="titleInput">会话标题</label>
+          <input id="titleInput" value="前端演示会话" />
+        </div>
+      </div>
+      <div class="section">
+        <h2>会话列表</h2>
+        <div id="sessionList" class="session-list"></div>
+      </div>
+      <div class="section">
+        <h2>问答后端</h2>
+        <div class="field">
+          <label for="backendModeSelect">检索后端</label>
+          <select id="backendModeSelect">
+            <option value="hash">hash</option>
+            <option value="faiss">faiss</option>
+          </select>
+        </div>
+        <div class="field inline-field">
+          <label for="useLlmCheckbox">接入 LLM</label>
+          <input id="useLlmCheckbox" type="checkbox" />
+        </div>
+        <div class="field">
+          <label for="llmProviderSelect">LLM Provider</label>
+          <select id="llmProviderSelect">
+            <option value="ollama">ollama</option>
+            <option value="openai_compatible">openai_compatible</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llmModelInput">LLM Model</label>
+          <input id="llmModelInput" placeholder="qwen2.5:3b / gpt-4o-mini" />
+        </div>
+        <div class="field">
+          <label for="llmApiBaseInput">LLM API Base</label>
+          <input id="llmApiBaseInput" placeholder="http://localhost:11434" />
+        </div>
+        <div class="field">
+          <label for="llmApiKeyInput">LLM API Key</label>
+          <input id="llmApiKeyInput" type="password" autocomplete="off" placeholder="仅本次浏览器会话临时使用" />
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>多轮对话</h2>
+          <button id="refreshOverviewBtn" class="ghost-btn">刷新总览</button>
+        </div>
+        <div id="chatMeta" class="chat-meta">当前未选择会话</div>
+        <div id="chatWindow" class="chat-window"></div>
+        <div class="composer">
+          <textarea id="messageInput" rows="3" placeholder="输入问题，例如：推荐20万内的插混SUV，重点看空间和油耗"></textarea>
+          <button id="sendBtn" class="primary-btn">发送</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>链路总览</h2>
+          <a href="/docs" target="_blank" rel="noreferrer">Swagger</a>
+        </div>
+        <div id="cards" class="cards"></div>
+      </section>
+
+      <section class="panel grid-panel">
+        <div class="module-card">
+          <h3>数据资产</h3>
+          <pre id="assetsBox">加载中...</pre>
+        </div>
+        <div class="module-card">
+          <h3>评测结果</h3>
+          <pre id="evaluationBox">加载中...</pre>
+        </div>
+        <div class="module-card">
+          <h3>反馈回流</h3>
+          <pre id="feedbackBox">加载中...</pre>
+        </div>
+        <div class="module-card">
+          <h3>工作流状态</h3>
+          <pre id="workflowBox">加载中...</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

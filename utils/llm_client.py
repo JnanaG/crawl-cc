@@ -1,6 +1,10 @@
 import os
+import logging
+import time
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class LLMClient:
@@ -40,6 +44,7 @@ class LLMClient:
         raise ValueError(f"不支持的 llm provider: {provider}")
 
     def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        started_at = time.perf_counter()
         if self.provider == "openai_compatible":
             url = f"{self.api_base}/v1/chat/completions"
             headers = {
@@ -54,10 +59,41 @@ class LLMClient:
                 ],
                 "temperature": temperature,
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
-            resp.raise_for_status()
-            body = resp.json()
-            return body["choices"][0]["message"]["content"]
+            logger.info(
+                "llm_request_started provider=%s model=%s url=%s system_chars=%s user_chars=%s temperature=%s timeout_sec=%s",
+                self.provider,
+                self.model,
+                url,
+                len(system_prompt),
+                len(user_prompt),
+                temperature,
+                self.timeout_sec,
+            )
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
+                resp.raise_for_status()
+                body = resp.json()
+                content = body["choices"][0]["message"]["content"]
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                logger.info(
+                    "llm_request_finished provider=%s model=%s latency_ms=%s answer_chars=%s",
+                    self.provider,
+                    self.model,
+                    latency_ms,
+                    len(content or ""),
+                )
+                return content
+            except Exception as exc:
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                logger.exception(
+                    "llm_request_failed provider=%s model=%s url=%s latency_ms=%s error=%s",
+                    self.provider,
+                    self.model,
+                    url,
+                    latency_ms,
+                    exc,
+                )
+                raise
 
         url = f"{self.api_base}/api/chat"
         payload = {
@@ -69,8 +105,39 @@ class LLMClient:
             "stream": False,
             "options": {"temperature": temperature},
         }
-        resp = requests.post(url, json=payload, timeout=self.timeout_sec)
-        resp.raise_for_status()
-        body = resp.json()
-        message = body.get("message", {})
-        return message.get("content", "")
+        logger.info(
+            "llm_request_started provider=%s model=%s url=%s system_chars=%s user_chars=%s temperature=%s timeout_sec=%s",
+            self.provider,
+            self.model,
+            url,
+            len(system_prompt),
+            len(user_prompt),
+            temperature,
+            self.timeout_sec,
+        )
+        try:
+            resp = requests.post(url, json=payload, timeout=self.timeout_sec)
+            resp.raise_for_status()
+            body = resp.json()
+            message = body.get("message", {})
+            content = message.get("content", "")
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            logger.info(
+                "llm_request_finished provider=%s model=%s latency_ms=%s answer_chars=%s",
+                self.provider,
+                self.model,
+                latency_ms,
+                len(content or ""),
+            )
+            return content
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            logger.exception(
+                "llm_request_failed provider=%s model=%s url=%s latency_ms=%s error=%s",
+                self.provider,
+                self.model,
+                url,
+                latency_ms,
+                exc,
+            )
+            raise
