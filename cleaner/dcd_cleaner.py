@@ -63,6 +63,34 @@ class DongchediCleaner:
         return dimensions
 
     def _extract_images(self, page_props: dict) -> list[dict]:
+        selected_modules = self._as_dict(page_props.get("selectedImageModules"))
+        if selected_modules:
+            images = []
+            for module_key in ("wg", "ns"):
+                module = self._as_dict(selected_modules.get(module_key))
+                if not module:
+                    continue
+                samples = self._as_list(module.get("selected_images"))
+                images.append(
+                    {
+                        "category": module_key,
+                        "category_name": module.get("category_name"),
+                        "sample_count": len(samples),
+                        "required_view": module.get("required_view"),
+                        "sample_models": [
+                            sample.get("car_name")
+                            for sample in samples[:5]
+                            if isinstance(sample, dict) and sample.get("car_name")
+                        ],
+                        "sample_colors": [
+                            color.get("color_name")
+                            for color in self._as_list(module.get("available_colors"))[:5]
+                            if isinstance(color, dict) and color.get("color_name")
+                        ],
+                    }
+                )
+            return images
+
         images = []
         image_floor_data = self._as_dict(page_props.get("imageFloorData"))
         for item in self._as_list(image_floor_data.get("floor_head_list")):
@@ -83,6 +111,8 @@ class DongchediCleaner:
         return images
 
     def _extract_news(self, page_props: dict) -> list[dict]:
+        if self._as_dict(page_props.get("selectedImageModules")):
+            return []
         news_sections = [
             ("newest", self._as_list(page_props.get("newestStaticNews"))),
             ("guide", self._as_list(page_props.get("guideStaticNews"))),

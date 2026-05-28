@@ -11,6 +11,7 @@ class EmbeddingClient:
     2) fastembed (本地ONNX模型, 无torch依赖)
     3) openai_compatible (远端API)
     4) ollama (本地/远端Ollama Embeddings API)
+    5) hash (离线调试用轻量 hash embedding)
     """
 
     def __init__(
@@ -70,9 +71,35 @@ class EmbeddingClient:
             self._model = None
             return
 
+        if provider == "hash":
+            self.model_name = model or os.getenv("EMBEDDING_MODEL", "hash-embedding-v1")
+            self.api_base = None
+            self.api_key = None
+            self.dimension = 768
+            self._model = None
+            return
+
         raise ValueError(f"不支持的 embedding provider: {provider}")
 
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        if self.provider == "hash":
+            import hashlib
+            import numpy as np
+
+            vectors = []
+            for text in texts:
+                vec = np.zeros(self.dimension, dtype=np.float32)
+                for token in (text or "").strip():
+                    h = hashlib.md5(token.encode("utf-8")).hexdigest()
+                    idx = int(h[:8], 16) % self.dimension
+                    sign = -1.0 if (int(h[8:10], 16) % 2) else 1.0
+                    vec[idx] += sign
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec /= norm
+                vectors.append(vec.tolist())
+            return vectors
+
         if self.provider == "sentence_transformers":
             vectors = self._model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False)
             return vectors.tolist()

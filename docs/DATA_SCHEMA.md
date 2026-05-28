@@ -8,16 +8,21 @@
 
 - `data/raw/dongchedi/series_<series_id>.html`
 - `data/raw/dongchedi/series_<series_id>.json`
+- `data/raw/dongchedi/series_<series_id>_images.json`
+- `data/raw/dongchedi/images/series_<series_id>/*`
 
 用途:
 
 - 保留页面原始 HTML，便于回放、调试和选择新的提取字段
 - 保留页面 `__NEXT_DATA__` 原始 JSON，便于稳定重跑清洗逻辑
+- 保留车系页相关原始图片文件，供多模态 caption、视觉训练和人工质检复用
+- 保留图片保存 manifest，供图片资产层回填 `local_path`
 
 字段约定:
 
 - 文件名中的 `series_id` 是车系主键
 - HTML 与 JSON 必须一一对应
+- `series_<series_id>_images.json` 记录每张原始图片的 URL、来源、保存状态、本地路径和字节数
 
 ## 2. Cleaned Layer
 
@@ -160,8 +165,86 @@ JSONL 字段:
 - 清洗层只保存“结构化、可复用”的业务字段
 - 训练层只保存“适合大模型直接消费”的文本与必要元数据
 
+## 4. Multimodal Layer
+
+目录:
+
+- `data/multimodal/image_assets.jsonl`
+- `data/multimodal/image_assets.parquet`
+- `data/multimodal/image_classification_manifest.jsonl`
+- `data/multimodal/image_classification_manifest.parquet`
+- `data/multimodal/image_series_summary.parquet`
+- `data/multimodal/image_dataset_summary.json`
+
+用途:
+
+- 从懂车帝原始车系页中抽取可复用图片资产
+- 为图像分类、小模型训练、人工质检、图文检索提供统一 manifest
+- 在不依赖图像解码的前提下先做第一阶段质量打分和筛选
+
+`image_assets` 字段:
+
+- `asset_id`
+- `series_id`
+- `series_name`
+- `brand_name`
+- `image_url`
+- `category`
+- `category_name`
+- `source_section`
+- `image_role`
+- `rank`
+- `width`
+- `height`
+- `car_id`
+- `color_id`
+- `color_name`
+- `raw_ref`
+- `local_path`
+- `local_exists`
+- `raw_image_status`
+- `raw_content_type`
+- `raw_bytes`
+- `quality_score`
+- `quality_flags`
+- `is_usable`
+
+`image_classification_manifest` 额外字段:
+
+- `task_type`
+- `dataset_split`
+
+`image_caption_corpus` 字段:
+
+- `metadata.source`
+- `metadata.url`
+- `metadata.title`
+- `metadata.series_id`
+- `metadata.brand_name`
+- `metadata.asset_id`
+- `metadata.image_url`
+- `metadata.image_category`
+- `metadata.image_category_name`
+- `metadata.image_role`
+- `metadata.image_source_section`
+- `metadata.image_quality_score`
+- `metadata.modality`
+- `metadata.content_type`
+- `metadata.caption_provider`
+- `metadata.caption_model`
+- `metadata.caption_prompt_version`
+- `text`
+
+说明:
+
+- `image_assets` 是图片主资产表，面向多模态任务复用
+- `image_classification_manifest` 是面向视觉分类的候选训练集清单
+- `image_caption_corpus` 是将图片理解结果文本化后的 RAG 语料，可直接并入现有 embedding / vector store 流程
+- `dataset_split` 由 `asset_id` 做稳定切分，默认生成 `train / val / test`
+
 ## 后续演进建议
 
 - `schema_version` 从 `v1` 开始，后续字段变更必须升级版本
 - 新增字段优先进入 cleaned layer，再决定是否进入 training layer
 - 删除字段前先检查是否被评估脚本、RAG 或微调任务依赖
+- 多模态新增字段优先写入 `image_assets`，稳定后再考虑沉淀进 cleaned layer

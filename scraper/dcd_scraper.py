@@ -3,13 +3,38 @@ import json
 import re
 import os
 import random
+import hashlib
 import time
-from urllib.parse import quote
+from copy import deepcopy
+from urllib.parse import quote, urlparse
 from loguru import logger
 from bs4 import BeautifulSoup
 
 
 class DongchediScraper:
+    NEWS_KEYS = (
+        "newestStaticNews",
+        "guideStaticNews",
+        "newcarStaticNews",
+        "evaluatingStaticNews",
+        "originalStaticNews",
+    )
+
+    IMAGE_MODULE_SPECS = {
+        "wg": {
+            "path": "images-wg",
+            "category_name": "外观",
+            "required_view": "正面前脸图",
+            "source_section": "module_wg",
+        },
+        "ns": {
+            "path": "images-ns",
+            "category_name": "内饰",
+            "required_view": "正面主副驾拍摄图",
+            "source_section": "module_ns",
+        },
+    }
+
     def __init__(self, min_interval_sec: float = 0.8, max_retry: int = 3):
         self.base_url = "https://www.dongchedi.com"
         self.session = requests.Session()
@@ -22,7 +47,9 @@ class DongchediScraper:
         self.last_request_ts = 0.0
         # 确保原始数据存储目录存在
         self.raw_dir = os.path.join("data", "raw", "dongchedi")
+        self.raw_image_dir = os.path.join(self.raw_dir, "images")
         os.makedirs(self.raw_dir, exist_ok=True)
+        os.makedirs(self.raw_image_dir, exist_ok=True)
 
     def _throttle(self):
         now = time.monotonic()
@@ -56,6 +83,380 @@ class DongchediScraper:
                     backoff = min(2 ** (attempt - 1), 8) + random.uniform(0.1, 0.4)
                     time.sleep(backoff)
         return False, None, attempts - 1, last_status, last_error
+
+    def _request_binary_with_retry(self, url: str, timeout: int = 20):
+        last_error = ""
+        last_status = None
+        attempts = 0
+        for attempt in range(1, self.max_retry + 1):
+            attempts = attempt
+            try:
+                self._throttle()
+                resp = self.session.get(url, timeout=timeout, stream=True)
+                last_status = resp.status_code
+                if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    return False, None, attempts - 1, last_status, f"HTTP {resp.status_code}"
+                if resp.status_code >= 500:
+                    raise requests.HTTPError(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                return True, resp, attempts - 1, last_status, ""
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"图片请求失败({attempt}/{self.max_retry}) url={url}, error={e}")
+                if attempt < self.max_retry:
+                    backoff = min(2 ** (attempt - 1), 8) + random.uniform(0.1, 0.4)
+                    time.sleep(backoff)
+        return False, None, attempts - 1, last_status, last_error
+
+    @staticmethod
+    def _as_dict(value) -> dict:
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _as_list(value) -> list:
+        return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        if not isinstance(url, str):
+            return ""
+        url = url.strip()
+        if not url:
+            return ""
+        if url.startswith("//"):
+            return f"https:{url}"
+        return url
+
+    @staticmethod
+    def _infer_extension(url: str, content_type: str = "") -> str:
+        content_type = (content_type or "").split(";")[0].strip().lower()
+        if content_type == "image/jpeg":
+            return ".jpg"
+        if content_type == "image/png":
+            return ".png"
+        if content_type == "image/webp":
+            return ".webp"
+        if content_type == "image/gif":
+            return ".gif"
+        path = (urlparse(url).path or "").lower()
+        for suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
+            if path.endswith(suffix):
+                return suffix
+        if ".image" in path:
+            return ".jpg"
+        return ".bin"
+
+    @staticmethod
+    def _make_image_asset_id(series_id: str, image_url: str, source_section: str, image_role: str, rank: int) -> str:
+        raw = "|".join([str(series_id or ""), image_url, source_section, image_role, str(rank)])
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _append_image_task(
+        self,
+        tasks: list[dict],
+        seen: set[tuple[str, str, str]],
+        *,
+        series_id: str,
+        image_url,
+        source_section: str,
+        image_role: str,
+        rank: int,
+        category: str = "",
+        category_name: str = "",
+        raw_ref: str = "",
+    ) -> None:
+        normalized_url = self._normalize_url(image_url)
+        if not normalized_url:
+            return
+        dedupe_key = (normalized_url, source_section, str(rank))
+        if dedupe_key in seen:
+            return
+        seen.add(dedupe_key)
+        tasks.append(
+            {
+                "asset_id": self._make_image_asset_id(series_id, normalized_url, source_section, image_role, rank),
+                "series_id": str(series_id or ""),
+                "image_url": normalized_url,
+                "source_section": source_section,
+                "image_role": image_role,
+                "rank": rank,
+                "category": category or "",
+                "category_name": category_name or "",
+                "raw_ref": raw_ref,
+            }
+        )
+
+    def _extract_image_download_tasks(self, raw_json: dict, include_contextual_images: bool = True) -> list[dict]:
+        page_props = self._as_dict(self._as_dict(raw_json.get("props")).get("pageProps"))
+        series_head = self._as_dict(page_props.get("seriesHomeHead"))
+        series_id = str(page_props.get("seriesId") or series_head.get("series_id") or "")
+
+        tasks = []
+        seen: set[tuple[str, str, str]] = set()
+
+        self._append_image_task(
+            tasks,
+            seen,
+            series_id=series_id,
+            image_url=series_head.get("cover_url"),
+            source_section="series_cover",
+            image_role="cover",
+            rank=0,
+            category="cover",
+            category_name="封面",
+            raw_ref="pageProps.seriesHomeHead.cover_url",
+        )
+
+        selected_modules = self._as_dict(page_props.get("selectedImageModules"))
+        if selected_modules:
+            for module_key, module in selected_modules.items():
+                module = self._as_dict(module)
+                source_section = self.IMAGE_MODULE_SPECS.get(module_key, {}).get("source_section", f"module_{module_key}")
+                for idx, sample in enumerate(self._as_list(module.get("selected_images"))):
+                    sample = self._as_dict(sample)
+                    self._append_image_task(
+                        tasks,
+                        seen,
+                        series_id=series_id,
+                        image_url=sample.get("image_url"),
+                        source_section=source_section,
+                        image_role="module_sample",
+                        rank=idx,
+                        category=module_key,
+                        category_name=module.get("category_name") or "",
+                        raw_ref=f"pageProps.selectedImageModules.{module_key}.selected_images",
+                    )
+            return tasks
+
+        image_floor_data = self._as_dict(page_props.get("imageFloorData"))
+        for idx, item in enumerate(self._as_list(image_floor_data.get("floor_image_list"))):
+            item = self._as_dict(item)
+            category = str(item.get("category") or "")
+            category_name = str(item.get("text") or "")
+            for image_idx, image_info in enumerate(self._as_list(item.get("image_list"))):
+                image_info = self._as_dict(image_info)
+                self._append_image_task(
+                    tasks,
+                    seen,
+                    series_id=series_id,
+                    image_url=image_info.get("image_url") or image_info.get("url") or image_info.get("cover_url"),
+                    source_section="image_floor",
+                    image_role="gallery",
+                    rank=(idx * 1000) + image_idx,
+                    category=category,
+                    category_name=category_name,
+                    raw_ref="pageProps.imageFloorData.floor_image_list",
+                )
+
+        return tasks
+
+    def _extract_next_data_from_html(self, html_text: str) -> dict:
+        soup = BeautifulSoup(html_text, "html.parser")
+        script_tag = soup.find("script", id="__NEXT_DATA__")
+        if not script_tag:
+            raise ValueError("__NEXT_DATA__ missing")
+        return json.loads(script_tag.string)
+
+    def _fetch_page_next_data(self, url: str, html_path: str, json_path: str, timeout: int = 10) -> tuple[dict, dict]:
+        meta = {"url": url, "retry_count": 0, "http_status": None, "error": ""}
+        ok, resp, retry_count, http_status, err = self._request_with_retry(url, timeout=timeout)
+        meta["retry_count"] = retry_count
+        meta["http_status"] = http_status
+        if not ok or resp is None:
+            meta["error"] = err or "请求失败"
+            return {}, meta
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        try:
+            data = self._extract_next_data_from_html(resp.text)
+        except Exception as e:
+            meta["error"] = str(e)
+            return {}, meta
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return data, meta
+
+    def _strip_news_sections(self, data: dict) -> dict:
+        sanitized = deepcopy(data)
+        page_props = self._as_dict(self._as_dict(sanitized.get("props")).get("pageProps"))
+        for key in self.NEWS_KEYS:
+            page_props.pop(key, None)
+        return sanitized
+
+    def _build_selected_image_module(self, module_key: str, module_data: dict) -> dict:
+        spec = self.IMAGE_MODULE_SPECS[module_key]
+        page_props = self._as_dict(self._as_dict(module_data.get("props")).get("pageProps"))
+        picture_info = self._as_dict(page_props.get("pictureInfo"))
+        head = self._as_dict(page_props.get("head"))
+
+        color_lookup = {}
+        for category in self._as_list(head.get("category_list")):
+            category = self._as_dict(category)
+            if str(category.get("key") or "") != module_key:
+                continue
+            color_items = self._as_list(self._as_dict(category.get("filter")).get("color"))
+            for color in color_items:
+                color = self._as_dict(color)
+                color_lookup[str(color.get("key") or "")] = {
+                    "color_name": color.get("color_name") or "",
+                    "sub_color_name": color.get("sub_color_name") or "",
+                    "color": color.get("color") or "",
+                    "car_ids": self._as_list(color.get("car_ids")),
+                }
+
+        car_lookup = {}
+        for category in self._as_list(head.get("category_list")):
+            category = self._as_dict(category)
+            if str(category.get("key") or "") != module_key:
+                continue
+            car_groups = self._as_list(self._as_dict(category.get("filter")).get("car"))
+            for car_group in car_groups:
+                car_group = self._as_dict(car_group)
+                for car in self._as_list(car_group.get("car_list")):
+                    car = self._as_dict(car)
+                    car_lookup[str(car.get("car_id") or "")] = car
+
+        selected_images = []
+        for idx, item in enumerate(self._as_list(picture_info.get("picture_list"))):
+            item = self._as_dict(item)
+            pic_urls = [self._normalize_url(url) for url in self._as_list(item.get("pic_url")) if self._normalize_url(url)]
+            if not pic_urls:
+                continue
+            car_id = str(item.get("car_id") or "")
+            car_meta = self._as_dict(car_lookup.get(car_id))
+            color_keys = self._as_list(car_meta.get("color_keys"))
+            color_names = []
+            for key in color_keys:
+                color_meta = self._as_dict(color_lookup.get(str(key)))
+                color_name = color_meta.get("color_name") or ""
+                if color_name and color_name not in color_names:
+                    color_names.append(color_name)
+            selected_images.append(
+                {
+                    "rank": idx,
+                    "car_id": item.get("car_id"),
+                    "car_name": item.get("car_name") or car_meta.get("car_text") or car_meta.get("name"),
+                    "image_url": pic_urls[0],
+                    "candidate_image_urls": pic_urls,
+                    "sale_status": item.get("sale_status"),
+                    "available_color_names": color_names,
+                    "selection_rule": "first_picture",
+                    "required_view": spec["required_view"],
+                }
+            )
+
+        available_colors = []
+        for color_meta in color_lookup.values():
+            available_colors.append(
+                {
+                    "color_name": color_meta.get("color_name") or "",
+                    "sub_color_name": color_meta.get("sub_color_name") or "",
+                    "hex_color": color_meta.get("color") or "",
+                }
+            )
+
+        return {
+            "module_key": module_key,
+            "category_name": spec["category_name"],
+            "required_view": spec["required_view"],
+            "source_url": f"{self.base_url}/auto/series/{picture_info.get('series_id') or page_props.get('query', {}).get('seriesId')}/{spec['path']}",
+            "selected_images": selected_images,
+            "available_colors": available_colors,
+            "sample_count": len(selected_images),
+        }
+
+    def _build_compact_image_floor_data(self, selected_modules: dict) -> dict:
+        floor_image_list = []
+        for module_key in ("wg", "ns"):
+            module = self._as_dict(selected_modules.get(module_key))
+            image_list = []
+            for sample in self._as_list(module.get("selected_images")):
+                sample = self._as_dict(sample)
+                image_list.append(
+                    {
+                        "image_url": sample.get("image_url"),
+                        "car_id": sample.get("car_id"),
+                        "car_name": sample.get("car_name"),
+                        "color_name": ",".join(self._as_list(sample.get("available_color_names"))[:3]),
+                        "required_view": sample.get("required_view") or module.get("required_view"),
+                    }
+                )
+            floor_image_list.append(
+                {
+                    "category": module_key,
+                    "text": module.get("category_name") or "",
+                    "selection_rule": "first_picture",
+                    "required_view": module.get("required_view") or "",
+                    "image_list": image_list,
+                    "pic_count": len(image_list),
+                }
+            )
+        return {"floor_head_list": [], "floor_image_list": floor_image_list}
+
+    def save_series_images(self, series_id: str, raw_json: dict, include_contextual_images: bool = True) -> dict:
+        tasks = self._extract_image_download_tasks(raw_json, include_contextual_images=include_contextual_images)
+        series_image_dir = os.path.join(self.raw_image_dir, f"series_{series_id}")
+        os.makedirs(series_image_dir, exist_ok=True)
+        manifest_path = os.path.join(self.raw_dir, f"series_{series_id}_images.json")
+
+        manifest_items = []
+        success_count = 0
+        failed_count = 0
+
+        for task in tasks:
+            ok, resp, retry_count, http_status, err = self._request_binary_with_retry(task["image_url"], timeout=20)
+            item = {
+                **task,
+                "status": "failed",
+                "retry_count": retry_count,
+                "http_status": http_status,
+                "error": err,
+                "local_path": "",
+                "content_type": "",
+                "bytes": 0,
+            }
+            if ok and resp is not None:
+                try:
+                    content_type = resp.headers.get("content-type", "")
+                    ext = self._infer_extension(task["image_url"], content_type)
+                    filename = f"{int(task['rank']):05d}_{task['source_section']}_{task['asset_id']}{ext}"
+                    local_path = os.path.join(series_image_dir, filename)
+                    total_bytes = 0
+                    with open(local_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            total_bytes += len(chunk)
+                    item["status"] = "success"
+                    item["local_path"] = os.path.abspath(local_path)
+                    item["content_type"] = content_type
+                    item["bytes"] = total_bytes
+                    item["error"] = ""
+                    success_count += 1
+                except Exception as e:
+                    item["error"] = str(e)
+                    failed_count += 1
+            else:
+                failed_count += 1
+            manifest_items.append(item)
+
+        manifest = {
+            "series_id": str(series_id),
+            "image_count": len(tasks),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "items": manifest_items,
+        }
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        return {
+            "image_manifest_path": os.path.abspath(manifest_path),
+            "image_dir": os.path.abspath(series_image_dir),
+            "image_count": len(tasks),
+            "image_success_count": success_count,
+            "image_failed_count": failed_count,
+        }
 
     def get_homepage_series_ids(self, limit: int = 5) -> list[str]:
         """从首页获取热门车系的 ID 列表"""
@@ -212,7 +613,7 @@ class DongchediScraper:
         return ids[:target_count]
 
     def fetch_series_data(self, series_id: str) -> tuple[dict, dict]:
-        """抓取指定车系详情页，并提取出 __NEXT_DATA__ JSON，同时保存原始数据"""
+        """按固定 3 个模块抓取车系数据：首页 + images-wg + images-ns。"""
         url = f"{self.base_url}/auto/series/{series_id}"
         logger.info(f"正在抓取车系页: {url}")
         fetch_meta = {
@@ -220,37 +621,58 @@ class DongchediScraper:
             "retry_count": 0,
             "http_status": None,
             "error": "",
+            "module_meta": {},
+            "image_manifest_path": "",
+            "image_dir": "",
+            "image_count": 0,
+            "image_success_count": 0,
+            "image_failed_count": 0,
         }
         try:
-            ok, resp, retry_count, http_status, err = self._request_with_retry(url, timeout=10)
-            fetch_meta["retry_count"] = retry_count
-            fetch_meta["http_status"] = http_status
-            if not ok or resp is None:
-                fetch_meta["error"] = err or "请求失败"
+            home_html_path = os.path.join(self.raw_dir, f"series_{series_id}.html")
+            home_json_path = os.path.join(self.raw_dir, f"series_{series_id}.json")
+            home_data, home_meta = self._fetch_page_next_data(url, home_html_path, home_json_path, timeout=10)
+            fetch_meta["retry_count"] = home_meta["retry_count"]
+            fetch_meta["http_status"] = home_meta["http_status"]
+            if not home_data:
+                fetch_meta["error"] = home_meta["error"] or "主页请求失败"
                 return {}, fetch_meta
-            
-            # 保存原始 HTML (用于存档或后续备用分析)
-            html_path = os.path.join(self.raw_dir, f"series_{series_id}.html")
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(resp.text)
+
+            sanitized = self._strip_news_sections(home_data)
+            page_props = self._as_dict(self._as_dict(sanitized.get("props")).get("pageProps"))
+            selected_modules = {}
+            for module_key, spec in self.IMAGE_MODULE_SPECS.items():
+                module_url = f"{self.base_url}/auto/series/{series_id}/{spec['path']}"
+                module_html_path = os.path.join(self.raw_dir, f"series_{series_id}_{spec['path']}.html")
+                module_json_path = os.path.join(self.raw_dir, f"series_{series_id}_{spec['path']}.json")
+                module_data, module_meta = self._fetch_page_next_data(
+                    module_url,
+                    module_html_path,
+                    module_json_path,
+                    timeout=10,
+                )
+                fetch_meta["module_meta"][module_key] = module_meta
+                if not module_data:
+                    logger.warning(f"车系 {series_id} 的 {module_key} 模块抓取失败: {module_meta.get('error')}")
+                    continue
+                selected_modules[module_key] = self._build_selected_image_module(module_key, module_data)
+
+            page_props["selectedImageModules"] = selected_modules
+            page_props["imageFloorData"] = self._build_compact_image_floor_data(selected_modules)
+            page_props["seriesHomeHead"] = self._as_dict(page_props.get("seriesHomeHead"))
+            page_props["seriesHomeHead"]["series_image_info_list"] = []
+            page_props["seriesHomeHead"]["pics_summary_info"] = []
+
+            with open(home_json_path, "w", encoding="utf-8") as f:
+                json.dump(sanitized, f, ensure_ascii=False, indent=2)
+
+            try:
+                image_meta = self.save_series_images(series_id=str(series_id), raw_json=sanitized, include_contextual_images=False)
+                fetch_meta.update(image_meta)
+            except Exception as image_error:
+                logger.warning(f"车系 {series_id} 原始图片保存失败: {image_error}")
                 
-            # 解析页面中的 __NEXT_DATA__
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            script_tag = soup.find('script', id='__NEXT_DATA__')
-            
-            if not script_tag:
-                logger.warning(f"车系 {series_id} 页面未找到 __NEXT_DATA__ 节点")
-                fetch_meta["error"] = "__NEXT_DATA__ missing"
-                return {}, fetch_meta
-                
-            data = json.loads(script_tag.string)
-            
-            # 同样将提取出来的核心 JSON 保存一份原始数据
-            json_path = os.path.join(self.raw_dir, f"series_{series_id}.json")
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                
-            return data, fetch_meta
+            return sanitized, fetch_meta
             
         except Exception as e:
             logger.error(f"抓取车系 {series_id} 失败: {e}")

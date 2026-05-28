@@ -35,6 +35,15 @@ def load_training_items(jsonl_path: str) -> list[dict]:
     return items
 
 
+def load_training_items_from_paths(paths: list[str]) -> list[dict]:
+    all_items = []
+    for path in paths:
+        current_items = load_training_items(path)
+        logger.info(f"加载输入语料: path={path}, rows={len(current_items)}")
+        all_items.extend(current_items)
+    return all_items
+
+
 def batched(values: list, batch_size: int) -> Iterable[list]:
     for i in range(0, len(values), batch_size):
         yield values[i : i + batch_size]
@@ -227,17 +236,21 @@ def hybrid_search(
 
 
 def build_store(args) -> None:
-    logger.info(f"加载训练数据: {args.input}")
-    items = load_training_items(args.input)
+    input_paths = [args.input, *(args.extra_inputs or [])]
+    logger.info(f"加载训练数据: inputs={input_paths}")
+    items = load_training_items_from_paths(input_paths)
     logger.info(f"训练样本条数: {len(items)}")
 
     records = []
     texts = []
+    modality_counter = Counter()
     for item in items:
         text = item.get("text", "").strip()
         if not text:
             continue
-        records.append({"text": text, "metadata": item.get("metadata", {})})
+        metadata = item.get("metadata", {})
+        modality_counter[metadata.get("modality") or metadata.get("content_type") or "text"] += 1
+        records.append({"text": text, "metadata": metadata})
         texts.append(text)
 
     emb_client = EmbeddingClient(
@@ -290,6 +303,7 @@ def build_store(args) -> None:
         )
         logger.info(f"轻量存储层写入完成: db={args.storage_db}, run_id={run_id}")
     logger.info(f"FAISS 构建完成: vectors={len(records)}, dim={dim}")
+    logger.info(f"语料模态分布: {dict(modality_counter)}")
     logger.info(f"索引文件: {args.index}")
     logger.info(f"记录文件: {args.records}")
     logger.info(f"元信息文件: {args.meta}")
@@ -314,8 +328,11 @@ def build_context(hits: list[SearchHit], max_chars: int) -> str:
         title = hit.metadata.get("title", "未知车系")
         url = hit.metadata.get("url", "N/A")
         sid = hit.metadata.get("series_id", "")
+        modality = hit.metadata.get("modality") or hit.metadata.get("content_type") or "text"
+        image_category = hit.metadata.get("image_category_name") or ""
         block = (
-            f"[{i}] title={title}; series_id={sid}; score={hit.score:.4f}; url={url}\n"
+            f"[{i}] title={title}; series_id={sid}; modality={modality}; "
+            f"image_category={image_category or 'N/A'}; score={hit.score:.4f}; url={url}\n"
             f"{hit.text}\n"
         )
         if used + len(block) > max_chars:
@@ -440,13 +457,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_build = sub.add_parser("build", help="构建 FAISS 向量库")
     p_build.add_argument("--input", default=DEFAULT_INPUT)
+    p_build.add_argument("--extra-inputs", nargs="*", default=[])
     p_build.add_argument("--index", default=DEFAULT_INDEX)
     p_build.add_argument("--records", default=DEFAULT_RECORDS)
     p_build.add_argument("--meta", default=DEFAULT_META)
     p_build.add_argument(
         "--embedding-provider",
         default="openai_compatible",
-        choices=["openai_compatible", "ollama", "fastembed", "sentence_transformers"],
+        choices=["openai_compatible", "ollama", "fastembed", "sentence_transformers", "hash"],
     )
     p_build.add_argument("--embedding-model", default=None)
     p_build.add_argument("--embedding-api-base", default=None)
@@ -479,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument(
         "--embedding-provider",
         default="openai_compatible",
-        choices=["openai_compatible", "ollama", "fastembed", "sentence_transformers"],
+        choices=["openai_compatible", "ollama", "fastembed", "sentence_transformers", "hash"],
     )
     p_query.add_argument("--embedding-model", default=None)
     p_query.add_argument("--embedding-api-base", default=None)
